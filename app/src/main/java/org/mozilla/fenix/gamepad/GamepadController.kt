@@ -17,6 +17,8 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
+import org.mozilla.fenix.components.appstate.AppAction.SearchAction.SearchStarted
+import org.mozilla.fenix.ext.components
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -51,9 +53,11 @@ class GamepadController(private val activity: ComponentActivity) {
     private val clickKey = KeyEvent.KEYCODE_BUTTON_A
     private val backKey = KeyEvent.KEYCODE_BUTTON_B
 
-    // The address bar is a single Compose view (R.id.composable_toolbar); tapping the
-    // middle of it lands on the URL text and opens the search / edit screen.
-    private val urlBarIdNames = listOf("composable_toolbar", "toolbar")
+    // On the browser screen the address bar is a single Compose view
+    // (R.id.composable_toolbar); tapping the middle of it lands on the URL text.
+    // The home screen (empty new tab) draws its address bar inside the fragment's own
+    // Compose content, so it has no view of its own and is handled in openUrlBar().
+    private val urlBarIdNames = listOf("composable_toolbar")
     // ----------------------------------------------------------------------
 
     private val density = activity.resources.displayMetrics.density
@@ -270,7 +274,20 @@ class GamepadController(private val activity: ComponentActivity) {
 
     // ---- Toolbar buttons ----------------------------------------------------
 
-    private fun openUrlBar() = findVisible(urlBarIdNames)?.let(::tapCenter)
+    private fun openUrlBar() {
+        val toolbar = findVisible(urlBarIdNames)
+        if (toolbar != null) {
+            tapCenter(toolbar)
+            return
+        }
+
+        // Home screen / empty new tab: do exactly what tapping the home address bar does
+        // (DefaultToolbarController.handleNavigateSearch), which switches the toolbar to edit mode.
+        val appStore = activity.components.appStore
+        if (!appStore.state.searchState.isSearchActive) {
+            appStore.dispatch(SearchStarted())
+        }
+    }
 
     /**
      * Reuses HomeActivity's existing KEYCODE_MENU handling, which navigates to the

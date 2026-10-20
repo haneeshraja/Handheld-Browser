@@ -26,6 +26,7 @@ import org.mozilla.fenix.NavGraphDirections
 import org.mozilla.fenix.R
 import org.mozilla.fenix.browser.browsingmode.BrowsingMode
 import org.mozilla.fenix.components.appstate.AppAction.SearchAction.SearchStarted
+import org.mozilla.fenix.ext.canGoBackInHistoryOrToStories
 import org.mozilla.fenix.ext.components
 import kotlin.math.abs
 import kotlin.math.ln
@@ -43,7 +44,7 @@ import kotlin.math.sign
  *  Left stick press (L3)  -> new tab (in the current normal / private mode)
  *  Right stick press (R3) -> close the active tab
  *  L2 / left trigger      -> toggle between standard and private (incognito) browsing
- *  L1 / R1                -> previous / next tab; hold to keep switching, getting faster
+ *  L1 / R1                -> page back / page forward (browser history of the active tab)
  *  B            -> back
  *  D-pad        -> left untouched so Android's normal focus navigation works
  *                  inside menus / dialogs (they take window focus, so their
@@ -69,12 +70,6 @@ class GamepadController(private val activity: HomeActivity) {
     private val triggerPressThreshold = 0.6f
     private val triggerReleaseThreshold = 0.3f
 
-    // Holding L1 / R1: first repeat after the initial delay, then slow, then fast.
-    private val repeatInitialDelayMs = 400L
-    private val repeatSlowIntervalMs = 220L
-    private val repeatFastIntervalMs = 90L
-    private val repeatsBeforeFast = 5
-
     // Button codes (Xbox layout as reported by Android). If your handheld uses
     // Nintendo-style mapping and the buttons feel swapped, swap these here.
     private val urlBarKey = KeyEvent.KEYCODE_BUTTON_X
@@ -84,8 +79,8 @@ class GamepadController(private val activity: HomeActivity) {
     private val newTabKey = KeyEvent.KEYCODE_BUTTON_THUMBL
     private val closeTabKey = KeyEvent.KEYCODE_BUTTON_THUMBR
     private val privateModeKey = KeyEvent.KEYCODE_BUTTON_L2
-    private val prevTabKey = KeyEvent.KEYCODE_BUTTON_L1
-    private val nextTabKey = KeyEvent.KEYCODE_BUTTON_R1
+    private val pageBackKey = KeyEvent.KEYCODE_BUTTON_L1
+    private val pageForwardKey = KeyEvent.KEYCODE_BUTTON_R1
 
     // On the browser screen the address bar is a single Compose view
     // (R.id.composable_toolbar); tapping the middle of it lands on the URL text.
@@ -113,10 +108,6 @@ class GamepadController(private val activity: HomeActivity) {
     private var leftTriggerHeld = false
     private var lastModeToggleMs = 0L
     private var lastTabActionMs = 0L
-
-    private var tabRepeatKey = 0
-    private var tabRepeatDirection = 0
-    private var tabRepeatCount = 0
 
     // ---- Public hooks -------------------------------------------------------
 
@@ -183,19 +174,19 @@ class GamepadController(private val activity: HomeActivity) {
                 if (firstPress) togglePrivateMode()
                 true
             }
-            prevTabKey, nextTabKey -> {
-                val direction = if (event.keyCode == nextTabKey) 1 else -1
-                when (event.action) {
-                    KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0) startTabRepeat(event.keyCode, direction)
-                    KeyEvent.ACTION_UP -> stopTabRepeat(event.keyCode)
-                }
-                true // also swallows the system's own key repeats; we do our own
+            pageBackKey -> {
+                if (firstPress) pageBack()
+                true
+            }
+            pageForwardKey -> {
+                if (firstPress) pageForward()
+                true
             }
             else -> false // D-pad etc: default Android handling
         }
     }
 
-    /** Call from onPause so we never keep a frame callback or repeat running. */
+    /** Call from onPause so we never keep a frame callback running. */
     fun release() {
         looping = false
         lastFrameNanos = 0L
@@ -203,7 +194,6 @@ class GamepadController(private val activity: HomeActivity) {
         leftY = 0f
         rightY = 0f
         leftTriggerHeld = false
-        tabRepeatKey = 0
         handler.removeCallbacksAndMessages(null)
     }
 
@@ -476,47 +466,32 @@ class GamepadController(private val activity: HomeActivity) {
         }
     }
 
-    /** Select the previous (-1) or next (+1) tab in the current mode, wrapping around. */
-    private fun switchTab(direction: Int) {
+    /** Page back in the active tab's history (same as the toolbar / menu back button). */
+    private fun pageBack() {
         if (!isMainScreen()) return
 
         val state = activity.components.core.store.state
-        val tabs = state.getNormalOrPrivateTabs(private = activity.browsingModeManager.mode.isPrivate)
-        if (tabs.size < 2) return
-
-        val currentIndex = max(tabs.indexOfFirst { it.id == state.selectedTabId }, 0)
-        val nextIndex = (currentIndex + direction + tabs.size) % tabs.size
-        activity.components.useCases.tabsUseCases.selectTab(tabs[nextIndex].id)
-        scheduleDestinationSync()
-    }
-
-    private val tabRepeatRunnable = object : Runnable {
-        override fun run() {
-            // If a menu / dialog took focus we may never see the key-up, so don't run away.
-            if (tabRepeatKey == 0 || !activity.hasWindowFocus()) {
-                tabRepeatKey = 0
-                return
+        val tab = state.selectedTab ?: return
+        when {
+            tab.content.canGoBack -> {
+                activity.components.useCases.sessionUseCases.goBack.invoke(tab.id)
+                scheduleDestinationSync()
             }
-            switchTab(tabRepeatDirection)
-            tabRepeatCount++
-            val interval = if (tabRepeatCount >= repeatsBeforeFast) repeatFastIntervalMs else repeatSlowIntervalMs
-            handler.postDelayed(this, interval)
+            // e.g. a story opened from the stories screen: let the normal back handling return to it.
+            state.canGoBackInHistoryOrToStories() -> activity.onBackPressedDispatcher.onBackPressed()
         }
     }
 
-    private fun startTabRepeat(keyCode: Int, direction: Int) {
-        handler.removeCallbacks(tabRepeatRunnable)
-        tabRepeatKey = keyCode
-        tabRepeatDirection = direction
-        tabRepeatCount = 0
-        switchTab(direction)
-        handler.postDelayed(tabRepeatRunnable, repeatInitialDelayMs)
-    }
+    /** Page forward in the active tab's history. */
+    private fun pageForward() {
+        if (!isMainScreen()) return
 
-    private fun stopTabRepeat(keyCode: Int) {
-        if (keyCode != tabRepeatKey) return
-        tabRepeatKey = 0
-        handler.removeCallbacks(tabRepeatRunnable)
+        val tab = activity.components.core.store.state.selectedTab ?: return
+        if (tab.content.canGoForward) {
+            activity.components.useCases.sessionUseCases.goForward.invoke(tab.id)
+            // Going forward from the home screen lands on a web page: make sure it's shown.
+            scheduleDestinationSync()
+        }
     }
 
     /** L2 reported as an analog axis (Xbox-style pads): fire once per pull, re-arm on release. */

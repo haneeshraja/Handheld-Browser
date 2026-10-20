@@ -28,6 +28,7 @@ import org.mozilla.fenix.browser.browsingmode.BrowsingMode
 import org.mozilla.fenix.components.appstate.AppAction.SearchAction.SearchStarted
 import org.mozilla.fenix.ext.components
 import kotlin.math.abs
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sign
@@ -56,7 +57,12 @@ class GamepadController(private val activity: HomeActivity) {
     // ---- Tunables ---------------------------------------------------------
     private val deadZone = 0.15f
     private val cursorSpeedDpPerSec = 750f
-    private val scrollLinesPerSec = 14f
+
+    // Scrolling: full stick deflection scrolls at scrollMaxLinesPerSec, a released stick doesn't scroll.
+    // scrollCurveStrength shapes the response logarithmically: higher = faster pick-up for small
+    // pushes (flatter towards the top). Roughly: 10% of travel -> ~28%, 50% -> ~74% of max speed.
+    private val scrollMaxLinesPerSec = 32f
+    private val scrollCurveStrength = 9f
     private val cursorSizeDp = 20
 
     // Analog trigger thresholds (with hysteresis) for L2 on pads that report it as an axis.
@@ -213,7 +219,7 @@ class GamepadController(private val activity: HomeActivity) {
 
             val dx = shape(leftX)
             val dy = shape(leftY)
-            val scroll = shape(rightY)
+            val scroll = scrollShape(rightY)
 
             if (dx == 0f && dy == 0f && scroll == 0f) {
                 looping = false
@@ -240,6 +246,17 @@ class GamepadController(private val activity: HomeActivity) {
         if (a < deadZone) return 0f
         val n = (a - deadZone) / (1f - deadZone)
         return sign(v) * n * n
+    }
+
+    /**
+     * Scroll response: 0 inside the dead zone, 1.0 at full deflection, and a logarithmic rise in between
+     * (ln(1 + k*x) / ln(1 + k)) so small pushes already move the page while the top end stays controllable.
+     */
+    private fun scrollShape(v: Float): Float {
+        val a = abs(v)
+        if (a < deadZone) return 0f
+        val n = ((a - deadZone) / (1f - deadZone)).coerceIn(0f, 1f)
+        return sign(v) * ln(1f + scrollCurveStrength * n) / ln(1f + scrollCurveStrength)
     }
 
     // ---- Cursor -------------------------------------------------------------
@@ -312,7 +329,7 @@ class GamepadController(private val activity: HomeActivity) {
     private fun scrollBy(amount: Float, dt: Float) {
         ensureCursor()
         cursorActive = true
-        sendMouse(MotionEvent.ACTION_SCROLL, -amount * scrollLinesPerSec * dt)
+        sendMouse(MotionEvent.ACTION_SCROLL, -amount * scrollMaxLinesPerSec * dt)
     }
 
     /** Finger-style tap: the most reliable way to click both native views and GeckoView. */

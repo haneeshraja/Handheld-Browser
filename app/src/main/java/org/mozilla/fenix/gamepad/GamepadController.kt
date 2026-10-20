@@ -16,7 +16,15 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
-import androidx.activity.ComponentActivity
+import androidx.navigation.findNavController
+import mozilla.components.browser.state.selector.getNormalOrPrivateTabs
+import mozilla.components.browser.state.selector.selectedTab
+import mozilla.components.concept.engine.utils.ABOUT_HOME_URL
+import org.mozilla.fenix.BrowserDirection
+import org.mozilla.fenix.HomeActivity
+import org.mozilla.fenix.NavGraphDirections
+import org.mozilla.fenix.R
+import org.mozilla.fenix.browser.browsingmode.BrowsingMode
 import org.mozilla.fenix.components.appstate.AppAction.SearchAction.SearchStarted
 import org.mozilla.fenix.ext.components
 import kotlin.math.abs
@@ -27,18 +35,23 @@ import kotlin.math.sign
 /**
  * Gamepad support for the browser.
  *
- *  Left stick  -> on-screen cursor (hover moves, A clicks)
- *  Right stick -> scroll up / down (injected mouse-wheel events)
- *  X           -> focus / open the URL bar
- *  Y           -> open the 3-dot menu (via the existing KEYCODE_MENU handler)
- *  B           -> back
- *  D-pad       -> left untouched so Android's normal focus navigation works
- *                 inside menus / dialogs (they take window focus, so their
- *                 key events never reach the Activity anyway)
+ *  Left stick   -> on-screen cursor (hover moves, A clicks)
+ *  Right stick  -> scroll up / down (injected mouse-wheel events)
+ *  X            -> focus / open the URL bar
+ *  Y            -> open the 3-dot menu (via the existing KEYCODE_MENU handler)
+ *  Left stick press (L3)  -> new tab (in the current normal / private mode)
+ *  Right stick press (R3) -> close the active tab
+ *  L2 / left trigger      -> toggle between standard and private (incognito) browsing
+ *  L1 / R1                -> previous / next tab; hold to keep switching, getting faster
+ *  B            -> back
+ *  D-pad        -> left untouched so Android's normal focus navigation works
+ *                  inside menus / dialogs (they take window focus, so their
+ *                  key events never reach the Activity anyway)
  *
  * Hooked up from HomeActivity's dispatchKeyEvent / dispatchGenericMotionEvent / onPause.
  */
-class GamepadController(private val activity: ComponentActivity) {
+@Suppress("TooManyFunctions", "LargeClass")
+class GamepadController(private val activity: HomeActivity) {
 
     // ---- Tunables ---------------------------------------------------------
     private val deadZone = 0.15f
@@ -46,12 +59,27 @@ class GamepadController(private val activity: ComponentActivity) {
     private val scrollLinesPerSec = 14f
     private val cursorSizeDp = 20
 
+    // Analog trigger thresholds (with hysteresis) for L2 on pads that report it as an axis.
+    private val triggerPressThreshold = 0.6f
+    private val triggerReleaseThreshold = 0.3f
+
+    // Holding L1 / R1: first repeat after the initial delay, then slow, then fast.
+    private val repeatInitialDelayMs = 400L
+    private val repeatSlowIntervalMs = 220L
+    private val repeatFastIntervalMs = 90L
+    private val repeatsBeforeFast = 5
+
     // Button codes (Xbox layout as reported by Android). If your handheld uses
     // Nintendo-style mapping and the buttons feel swapped, swap these here.
     private val urlBarKey = KeyEvent.KEYCODE_BUTTON_X
     private val menuKey = KeyEvent.KEYCODE_BUTTON_Y
     private val clickKey = KeyEvent.KEYCODE_BUTTON_A
     private val backKey = KeyEvent.KEYCODE_BUTTON_B
+    private val newTabKey = KeyEvent.KEYCODE_BUTTON_THUMBL
+    private val closeTabKey = KeyEvent.KEYCODE_BUTTON_THUMBR
+    private val privateModeKey = KeyEvent.KEYCODE_BUTTON_L2
+    private val prevTabKey = KeyEvent.KEYCODE_BUTTON_L1
+    private val nextTabKey = KeyEvent.KEYCODE_BUTTON_R1
 
     // On the browser screen the address bar is a single Compose view
     // (R.id.composable_toolbar); tapping the middle of it lands on the URL text.
@@ -76,12 +104,21 @@ class GamepadController(private val activity: ComponentActivity) {
     private var looping = false
     private var lastFrameNanos = 0L
 
+    private var leftTriggerHeld = false
+    private var lastModeToggleMs = 0L
+
+    private var tabRepeatKey = 0
+    private var tabRepeatDirection = 0
+    private var tabRepeatCount = 0
+
     // ---- Public hooks -------------------------------------------------------
 
     /** Call from Activity.dispatchGenericMotionEvent. Returns true if consumed. */
     fun onGenericMotionEvent(event: MotionEvent): Boolean {
         val isJoystick = (event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
         if (!isJoystick || event.action != MotionEvent.ACTION_MOVE) return false
+
+        handleLeftTriggerAxis(event)
 
         leftX = event.getAxisValue(MotionEvent.AXIS_X)
         leftY = event.getAxisValue(MotionEvent.AXIS_Y)
@@ -126,17 +163,40 @@ class GamepadController(private val activity: ComponentActivity) {
                 if (firstPress) activity.onBackPressedDispatcher.onBackPressed()
                 true
             }
+            newTabKey -> {
+                if (firstPress) openNewTab(activity.browsingModeManager.mode.isPrivate)
+                true
+            }
+            closeTabKey -> {
+                if (firstPress) closeActiveTab()
+                true
+            }
+            privateModeKey -> {
+                // Some pads report L2 as a key as well as an axis; togglePrivateMode() debounces.
+                if (firstPress) togglePrivateMode()
+                true
+            }
+            prevTabKey, nextTabKey -> {
+                val direction = if (event.keyCode == nextTabKey) 1 else -1
+                when (event.action) {
+                    KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0) startTabRepeat(event.keyCode, direction)
+                    KeyEvent.ACTION_UP -> stopTabRepeat(event.keyCode)
+                }
+                true // also swallows the system's own key repeats; we do our own
+            }
             else -> false // D-pad etc: default Android handling
         }
     }
 
-    /** Call from onPause so we never keep a frame callback running. */
+    /** Call from onPause so we never keep a frame callback or repeat running. */
     fun release() {
         looping = false
         lastFrameNanos = 0L
         leftX = 0f
         leftY = 0f
         rightY = 0f
+        leftTriggerHeld = false
+        tabRepeatKey = 0
         handler.removeCallbacksAndMessages(null)
     }
 
@@ -313,5 +373,154 @@ class GamepadController(private val activity: ComponentActivity) {
         val loc = IntArray(2)
         view.getLocationInWindow(loc)
         tap(loc[0] + view.width / 2f, loc[1] + view.height / 2f)
+    }
+
+    // ---- Tabs ---------------------------------------------------------------
+
+    private fun currentDestinationId(): Int? =
+        runCatching { activity.findNavController(R.id.container).currentDestination?.id }.getOrNull()
+
+    /** Tab actions only make sense on the home / browser screens, not in settings, the tab manager, etc. */
+    private fun isMainScreen(): Boolean {
+        val id = currentDestinationId()
+        return id == R.id.homeFragment || id == R.id.browserFragment
+    }
+
+    /** New tab in the given mode, following the same settings the tab manager uses. */
+    private fun openNewTab(private: Boolean) {
+        if (!isMainScreen()) return
+
+        val settings = activity.components.settings
+        val browserUseCases = activity.components.useCases.fenixBrowserUseCases
+        activity.browsingModeManager.mode = BrowsingMode.fromBoolean(private)
+
+        when {
+            !settings.shouldUseDefaultHomepage ->
+                browserUseCases.loadUrlOrSearch(
+                    searchTermOrURL = settings.customHomepageUrl,
+                    newTab = true,
+                    private = private,
+                )
+            // Selecting the new about:home tab makes AboutHomeBinding navigate to the home screen.
+            settings.enableHomepageAsNewTab -> browserUseCases.addNewHomepageTab(private = private)
+            currentDestinationId() != R.id.homeFragment ->
+                activity.findNavController(R.id.container).navigate(
+                    NavGraphDirections.actionGlobalHome(
+                        focusOnAddressBar = !settings.enableHomepageTrendingRecentSearch,
+                    ),
+                )
+        }
+        scheduleDestinationSync()
+    }
+
+    private fun closeActiveTab() {
+        if (!isMainScreen()) return
+
+        val selectedId = activity.components.core.store.state.selectedTabId ?: return
+        activity.components.useCases.tabsUseCases.removeTab(selectedId)
+        scheduleDestinationSync()
+    }
+
+    /**
+     * Switch between standard and private browsing. Lands on the most recently used tab of the
+     * other mode, or opens a new one if that mode has no tabs.
+     */
+    private fun togglePrivateMode() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastModeToggleMs < MODE_TOGGLE_DEBOUNCE_MS) return
+        lastModeToggleMs = now
+        if (!isMainScreen()) return
+
+        val toPrivate = !activity.browsingModeManager.mode.isPrivate
+        val target = activity.components.core.store.state
+            .getNormalOrPrivateTabs(private = toPrivate)
+            .maxByOrNull { it.lastAccess }
+
+        if (target == null) {
+            openNewTab(toPrivate)
+        } else {
+            activity.browsingModeManager.mode = BrowsingMode.fromBoolean(toPrivate)
+            activity.components.useCases.tabsUseCases.selectTab(target.id)
+            scheduleDestinationSync()
+        }
+    }
+
+    /** Select the previous (-1) or next (+1) tab in the current mode, wrapping around. */
+    private fun switchTab(direction: Int) {
+        if (!isMainScreen()) return
+
+        val state = activity.components.core.store.state
+        val tabs = state.getNormalOrPrivateTabs(private = activity.browsingModeManager.mode.isPrivate)
+        if (tabs.size < 2) return
+
+        val currentIndex = max(tabs.indexOfFirst { it.id == state.selectedTabId }, 0)
+        val nextIndex = (currentIndex + direction + tabs.size) % tabs.size
+        activity.components.useCases.tabsUseCases.selectTab(tabs[nextIndex].id)
+        scheduleDestinationSync()
+    }
+
+    private val tabRepeatRunnable = object : Runnable {
+        override fun run() {
+            // If a menu / dialog took focus we may never see the key-up, so don't run away.
+            if (tabRepeatKey == 0 || !activity.hasWindowFocus()) {
+                tabRepeatKey = 0
+                return
+            }
+            switchTab(tabRepeatDirection)
+            tabRepeatCount++
+            val interval = if (tabRepeatCount >= repeatsBeforeFast) repeatFastIntervalMs else repeatSlowIntervalMs
+            handler.postDelayed(this, interval)
+        }
+    }
+
+    private fun startTabRepeat(keyCode: Int, direction: Int) {
+        handler.removeCallbacks(tabRepeatRunnable)
+        tabRepeatKey = keyCode
+        tabRepeatDirection = direction
+        tabRepeatCount = 0
+        switchTab(direction)
+        handler.postDelayed(tabRepeatRunnable, repeatInitialDelayMs)
+    }
+
+    private fun stopTabRepeat(keyCode: Int) {
+        if (keyCode != tabRepeatKey) return
+        tabRepeatKey = 0
+        handler.removeCallbacks(tabRepeatRunnable)
+    }
+
+    /** L2 reported as an analog axis (Xbox-style pads): fire once per pull, re-arm on release. */
+    private fun handleLeftTriggerAxis(event: MotionEvent) {
+        val trigger = max(
+            event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+            event.getAxisValue(MotionEvent.AXIS_BRAKE),
+        )
+        if (!leftTriggerHeld && trigger > triggerPressThreshold) {
+            leftTriggerHeld = true
+            togglePrivateMode()
+        } else if (leftTriggerHeld && trigger < triggerReleaseThreshold) {
+            leftTriggerHeld = false
+        }
+    }
+
+    /**
+     * Tab selection is applied asynchronously by the store. Once it settles, make sure we're on the
+     * right screen: selecting a web page while on the home screen needs an explicit jump to the browser.
+     * (The reverse, landing on an about:home tab, is already handled by AboutHomeBinding.)
+     */
+    private val destinationSyncRunnable = Runnable {
+        val tab = activity.components.core.store.state.selectedTab
+        if (tab != null && tab.content.url != ABOUT_HOME_URL && currentDestinationId() == R.id.homeFragment) {
+            activity.openToBrowser(BrowserDirection.FromHome)
+        }
+    }
+
+    private fun scheduleDestinationSync() {
+        handler.removeCallbacks(destinationSyncRunnable)
+        handler.postDelayed(destinationSyncRunnable, DESTINATION_SYNC_DELAY_MS)
+    }
+
+    private companion object {
+        const val MODE_TOGGLE_DEBOUNCE_MS = 400L
+        const val DESTINATION_SYNC_DELAY_MS = 150L
     }
 }

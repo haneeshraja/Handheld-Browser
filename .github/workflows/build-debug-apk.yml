@@ -1,12 +1,8 @@
 name: Build Debug APK
 
 on:
+  # Manual only: run it from the Actions tab ("Run workflow") when you want an APK.
   workflow_dispatch:
-  pull_request:
-  push:
-    # iceraven is already built by ci.yml (release variant)
-    branches-ignore:
-      - iceraven
 
 concurrency:
   group: debug-apk-${{ github.ref }}

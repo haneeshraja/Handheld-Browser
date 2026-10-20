@@ -112,6 +112,7 @@ class GamepadController(private val activity: HomeActivity) {
 
     private var leftTriggerHeld = false
     private var lastModeToggleMs = 0L
+    private var lastTabActionMs = 0L
 
     private var tabRepeatKey = 0
     private var tabRepeatDirection = 0
@@ -170,11 +171,11 @@ class GamepadController(private val activity: HomeActivity) {
                 true
             }
             newTabKey -> {
-                if (firstPress) openNewTab(activity.browsingModeManager.mode.isPrivate)
+                if (firstPress && !isTabActionDebounced()) openNewTab(activity.browsingModeManager.mode.isPrivate)
                 true
             }
             closeTabKey -> {
-                if (firstPress) closeActiveTab()
+                if (firstPress && !isTabActionDebounced()) closeActiveTab()
                 true
             }
             privateModeKey -> {
@@ -403,6 +404,14 @@ class GamepadController(private val activity: HomeActivity) {
         return id == R.id.homeFragment || id == R.id.browserFragment
     }
 
+    /** Ignores a second new-tab / close-tab press that arrives right after the first (bounce / duplicate events). */
+    private fun isTabActionDebounced(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastTabActionMs < TAB_ACTION_DEBOUNCE_MS) return true
+        lastTabActionMs = now
+        return false
+    }
+
     /** New tab in the given mode, following the same settings the tab manager uses. */
     private fun openNewTab(private: Boolean) {
         if (!isMainScreen()) return
@@ -412,13 +421,19 @@ class GamepadController(private val activity: HomeActivity) {
         activity.browsingModeManager.mode = BrowsingMode.fromBoolean(private)
 
         when {
-            !settings.shouldUseDefaultHomepage ->
+            !settings.shouldUseDefaultHomepage -> {
                 browserUseCases.loadUrlOrSearch(
                     searchTermOrURL = settings.customHomepageUrl,
                     newTab = true,
                     private = private,
                 )
-            // Selecting the new about:home tab makes AboutHomeBinding navigate to the home screen.
+                // A real web page was opened: make sure we end up on the browser screen.
+                scheduleDestinationSync()
+            }
+            // Selecting the new about:home tab makes AboutHomeBinding navigate to the home screen
+            // (and if we're already there, nothing needs to move). Deliberately no extra navigation
+            // or destination sync here: doing our own navigation on top of the binding's is what
+            // makes the screen bounce.
             settings.enableHomepageAsNewTab -> browserUseCases.addNewHomepageTab(private = private)
             currentDestinationId() != R.id.homeFragment ->
                 activity.findNavController(R.id.container).navigate(
@@ -427,7 +442,6 @@ class GamepadController(private val activity: HomeActivity) {
                     ),
                 )
         }
-        scheduleDestinationSync()
     }
 
     private fun closeActiveTab() {
@@ -538,6 +552,7 @@ class GamepadController(private val activity: HomeActivity) {
 
     private companion object {
         const val MODE_TOGGLE_DEBOUNCE_MS = 400L
+        const val TAB_ACTION_DEBOUNCE_MS = 400L
         const val DESTINATION_SYNC_DELAY_MS = 150L
     }
 }

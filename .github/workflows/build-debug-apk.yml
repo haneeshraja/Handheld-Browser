@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build-debug:
-    name: Build forkDebug APKs
+    name: Build forkDebug APK (arm64-v8a)
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -52,18 +52,20 @@ jobs:
 
       # forkDebug is signed with the auto-generated Android debug key, so no
       # signing secrets are needed.
-      - name: Build forkDebug variant of app
+      # -PbenchmarkTest is an existing switch in app/build.gradle that limits the
+      # ABI split to arm64-v8a only (no armeabi-v7a / x86_64 / universal APKs).
+      - name: Build forkDebug variant of app (arm64-v8a only)
         env:
           GRADLE_OPTS: -Dorg.gradle.jvmargs="-XX:MaxMetaspaceSize=4g -Xms1g -Xmx7g -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dev/stderr"
-        run: ./gradlew app:assembleForkDebug -PversionName=${{ env.VERSION_NAME }} --stacktrace --no-daemon
+        run: ./gradlew app:assembleForkDebug -PbenchmarkTest -PversionName=${{ env.VERSION_NAME }} --stacktrace --no-daemon
 
       - name: List APKs
         run: find . -path '*outputs/apk/forkDebug*' -name '*.apk' -exec ls -alh {} \;
 
-      - name: Upload debug APKs
+      - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: handheld-browser-debug-apks
-          path: '**/outputs/apk/forkDebug/*.apk'
+          name: handheld-browser-debug-arm64
+          path: '**/outputs/apk/forkDebug/*arm64-v8a*.apk'
           if-no-files-found: error
           retention-days: 30

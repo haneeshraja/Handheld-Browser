@@ -156,6 +156,7 @@ import org.mozilla.fenix.ext.openSetDefaultBrowserOption
 import org.mozilla.fenix.ext.recordEventInNimbus
 import org.mozilla.fenix.ext.setNavigationIcon
 import org.mozilla.fenix.extension.WebExtensionPromptFeature
+import org.mozilla.fenix.gamepad.GamepadController
 import org.mozilla.fenix.home.HomeFragment
 import org.mozilla.fenix.home.TopSitesRefresher
 import org.mozilla.fenix.home.intent.AssistIntentProcessor
@@ -229,6 +230,8 @@ open class HomeActivity : LocaleAwareAppCompatActivity(), NavHostActivity, Crash
     private var privateNotificationObserver: PrivateNotificationFeature<PrivateNotificationService>? = null
 
     private var isToolbarInflated = false
+
+    private val gamepad by lazy(LazyThreadSafetyMode.NONE) { GamepadController(this) }
 
     private val webExtensionPopupObserver by lazy {
         WebExtensionPopupObserver(components.core.store, ::openPopup)
@@ -947,6 +950,8 @@ open class HomeActivity : LocaleAwareAppCompatActivity(), NavHostActivity, Crash
     }
 
     final override fun onPause() {
+        gamepad.release()
+
         // We should return to the browser if there were normal tabs when we left the app
         components.settings.shouldReturnToBrowser =
             components.core.store.state.getNormalOrPrivateTabs(private = false).isNotEmpty()
@@ -1327,7 +1332,12 @@ open class HomeActivity : LocaleAwareAppCompatActivity(), NavHostActivity, Crash
         return super.dispatchTouchEvent(ev)
     }
 
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean =
+        gamepad.onGenericMotionEvent(ev) || super.dispatchGenericMotionEvent(ev)
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (gamepad.onKeyEvent(event)) return true
+
         // The KEYCODE_MENU event is handled here instead of onKeyDown or onKeyUp because
         // after navigating to another fragment like Settings or Bookmarks, and then back this
         // key event is somehow getting consumed before it reaches onKeyDown or onKeyUp.

@@ -1,0 +1,69 @@
+name: Build Debug APK
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    # iceraven is already built by ci.yml (release variant)
+    branches-ignore:
+      - iceraven
+
+concurrency:
+  group: debug-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-debug:
+    name: Build forkDebug APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Install Android SDK with pieces Gradle skips
+        run: ./automation/iceraven/install-sdk.sh
+
+      - name: Create version name
+        run: echo "VERSION_NAME=$(git describe --tags --always HEAD)" >> $GITHUB_ENV
+
+      - name: Patch on the fly
+        run: |
+          ./automation/iceraven/patch_android_components.sh
+          ./automation/iceraven/setup_venv.sh
+
+      - name: Replace strings
+        run: |
+          sed -i 's/Firefox/Iceraven/g' app/src/*/res/values*/*strings.xml
+          sed -i '/about_content/s/Mozilla/@forkmaintainers/' app/src/*/res/values*/*strings.xml
+          sed -i '/<string name="trackers_blocked_panel_categorical_num_trackers_blocked">/s/%s/%1$s/g; /<string name="trackers_blocked_panel_categorical_num_trackers_blocked">/s/%d/%2$d/g' app/src/*/res/values*/*strings.xml
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # forkDebug is signed with the auto-generated Android debug key, so no
+      # signing secrets are needed.
+      - name: Build forkDebug variant of app
+        env:
+          GRADLE_OPTS: -Dorg.gradle.jvmargs="-XX:MaxMetaspaceSize=4g -Xms1g -Xmx7g -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dev/stderr"
+        run: ./gradlew app:assembleForkDebug -PversionName=${{ env.VERSION_NAME }} --stacktrace --no-daemon
+
+      - name: List APKs
+        run: find . -path '*outputs/apk/forkDebug*' -name '*.apk' -exec ls -alh {} \;
+
+      - name: Upload debug APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: handheld-browser-debug-apks
+          path: '**/outputs/apk/forkDebug/*.apk'
+          if-no-files-found: error
+          retention-days: 30
